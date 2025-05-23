@@ -1,0 +1,7 @@
+@CosmosVectorSearchApi_HostAddress = http://localhost:5291
+
+// Incident Controller - Ingest Data from Kusto to Vector Database with Custom Parameters
+POST {{CosmosVectorSearchApi_HostAddress}}/api/incident/ingest?containerName=vectorcontainer&partitionKeyPath=/IncidentId
+Accept: application/json
+
+###
