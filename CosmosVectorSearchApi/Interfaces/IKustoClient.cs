@@ -7,6 +7,6 @@ namespace CosmosVectorSearchApi.Interfaces
 {
     public interface IKustoClient
     {
-         Task<List<T>> Query<T>(string query, string database);
+         Task<List<T>> Query<T>(string query);
     }
 }

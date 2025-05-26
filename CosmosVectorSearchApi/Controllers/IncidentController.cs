@@ -1,9 +1,12 @@
 using Microsoft.AspNetCore.Mvc;
 using CosmosVectorSearchApi.Interfaces;
 using CosmosVectorSearchApi.Models;
-using Microsoft.SemanticKernel.Connectors.CosmosNoSql;
 using CosmosVectorSearchApi.Options;
 using Microsoft.Extensions.Options;
+using System.Linq;
+using System.Collections.Generic;
+using System;
+using System.Threading.Tasks;
 
 namespace CosmosVectorSearchApi.Controllers
 {
@@ -33,40 +36,27 @@ namespace CosmosVectorSearchApi.Controllers
 
         [HttpPost("ingest")]
         public async Task<IActionResult> IngestIncidentsFromKusto(
-            [FromQuery] string containerName = "incidents",
-            [FromQuery] string partitionKeyPath = "/IncidentId",
-            [FromQuery] string? kustoQuery = null)
+            [FromQuery] string databaseName,
+            [FromQuery] string collectionName = "incidents")
         {
             try
             {
-                _logger.LogInformation("Starting Kusto query and data ingestion");                // Execute the Kusto query
-                string query = !string.IsNullOrEmpty(kustoQuery)
-                    ? kustoQuery
-                    : "datawarehouse | take 2000"; // Default query if none provided
-
-                _logger.LogInformation("Executing Kusto query: {Query}", query);
-
-                // Use the new generic ExecuteQuery<T> method to get strongly-typed results directly
-                var incidents = await _kustoClient.Query<Incident>(query, _kustoOptions.KustoDatabase);
-
-                _logger.LogInformation("Retrieved {Count} incidents from Kusto", incidents.Count);
-
-                if (incidents.Count > 0)
+                _logger.LogInformation("Starting data ingestion process");
+                
+                if (string.IsNullOrEmpty(databaseName))
                 {
-                    var database = await _cosmosDbClient.GetDatabaseAsync();
-
-                    // Create a vector store collection
-                    var collection = new CosmosNoSqlCollection<string, Incident>(database, "incidents");
-
-                    // Ingest the data
-                    await _vectorDbService.IngestDataAsync(containerName, partitionKeyPath, collection, incidents);
-
-                    _logger.LogInformation("Successfully ingested {Count} incidents into Vector DB", incidents.Count);
-
+                    return BadRequest("Database name is required");
+                }
+                
+                // Call the simplified service method that handles the Kusto and Cosmos logic
+                bool success = await _vectorDbService.IngestDataAsync(databaseName, collectionName);
+                
+                if (success)
+                {
                     return Ok(new
                     {
-                        Message = $"Successfully ingested {incidents.Count} incidents into Vector DB",
-                        ContainerName = containerName
+                        Message = "Successfully ingested incidents into Vector DB",
+                        CollectionName = collectionName
                     });
                 }
                 else
@@ -79,8 +69,58 @@ namespace CosmosVectorSearchApi.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error querying Kusto and ingesting data");
-                return StatusCode(500, $"Error querying Kusto and ingesting data: {ex.Message}");
+                _logger.LogError(ex, "Error ingesting data");
+                return StatusCode(500, $"Error ingesting data: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Searches for similar incidents using multi-vector search based on an existing incident
+        /// </summary>
+        /// <returns>Incidents similar to the provided incident ordered by relevance</returns>
+        [HttpPost("search-similar")]
+        public async Task<IActionResult> SearchSimilarIncidents([FromBody] IncidentSearchParameters searchParams)
+        {
+            try
+            {
+                if (searchParams == null)
+                {
+                    return BadRequest("Search parameters are required");
+                }
+
+                if (searchParams.Incident == null)
+                {
+                    return BadRequest("Incident is required");
+                }
+
+                if (string.IsNullOrEmpty(searchParams.DatabaseName))
+                {
+                    return BadRequest("Database name is required");
+                }
+
+                _logger.LogInformation("Searching for incidents similar to incident with title: {Title}", searchParams.Incident.Title);
+                
+                // Use the VectorDbService to perform the search using the parameters model
+                var searchResults = await _vectorDbService.SearchSimilarIncidentsAsync(searchParams);
+                
+                // Transform the results to a more client-friendly format
+                var results = searchResults.Select(result => new
+                {
+                    incident = result.Item,
+                    similarityScore = result.SimilarityScore
+                }).ToList();
+                
+                return Ok(new
+                {
+                    sourceIncident = new { title = searchParams.Incident.Title, summary = searchParams.Incident.Summary },
+                    results,
+                    count = results.Count
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error searching for similar incidents");
+                return StatusCode(500, $"Error searching for similar incidents: {ex.Message}");
             }
         }
     }

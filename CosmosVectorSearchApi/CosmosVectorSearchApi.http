@@ -1,7 +1,38 @@
 @CosmosVectorSearchApi_HostAddress = http://localhost:5291
 
-// Incident Controller - Ingest Data from Kusto to Vector Database with Custom Parameters
-POST {{CosmosVectorSearchApi_HostAddress}}/api/incident/ingest?containerName=vectorcontainer&partitionKeyPath=/IncidentId
+// Incident Controller - Ingest Data from Kusto to Vector Database
+POST {{CosmosVectorSearchApi_HostAddress}}/api/incident/ingest?databaseName=incidents-db&collectionName=incidents
 Accept: application/json
+
+###
+
+// Incident Controller - Search for Similar Incidents using IncidentSearchParameters model
+POST {{CosmosVectorSearchApi_HostAddress}}/api/incident/search-similar
+Content-Type: application/json
+Accept: application/json
+
+{
+  "incident": {
+    "incidentId": "100080",
+    "severity": 4,
+    "status": "Resolved",
+    "owningTeamName": "Backend",
+    "owningContactAlias": "mark.taylor",
+    "tsgId": "TSG005",
+    "resolveDate": "2025-05-04T03:24:40",
+    "resolvedBy": "david.brown",
+    "title": "Data Loss in Cache System",
+    "mitigation": "Applied fix to Cache configuration",
+    "mitigateDate": "2025-05-01T21:24:40",
+    "mitigatedBy": "susan.miller",
+    "howFixed": "Permanent fix implemented in Cache system",
+    "summary": "Incident affecting Cache in India. High customer impact."
+  },
+  "databaseName": "incidents-db",
+  "collectionName": "incidents",
+  "titleWeight": 0.8,
+  "summaryWeight": 0.2,
+  "maxResults": 10
+}
 
 ###

@@ -9,13 +9,12 @@ namespace CosmosVectorSearchApi.Options
         public DefaultCosmosDbOptions(IConfiguration configuration)
         {
             _configuration = configuration;
-        }        public void Configure(CosmosDbOptions options)
+        }
+        public void Configure(CosmosDbOptions options)
         {
             options.Endpoint = _configuration.GetValue<string>($"{CosmosDbOptions.SectionName}:Endpoint") ?? string.Empty;
             options.ConnectionString = _configuration.GetValue<string>($"{CosmosDbOptions.SectionName}:ConnectionString") ?? string.Empty;
-            options.DatabaseName = _configuration.GetValue<string>($"{CosmosDbOptions.SectionName}:DatabaseName") ?? string.Empty;
-            options.ContainerName = _configuration.GetValue<string>($"{CosmosDbOptions.SectionName}:ContainerName") ?? string.Empty;
-        }       
+        }
 
     }
 }

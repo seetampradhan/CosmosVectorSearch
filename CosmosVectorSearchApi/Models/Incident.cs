@@ -34,9 +34,9 @@ namespace CosmosVectorSearchApi.Models
         public string HowFixed { get; set; } = string.Empty;
         [VectorStoreData]
         public string Summary { get; set; } = string.Empty;
-        [VectorStoreVector(Dimensions:256, IndexKind = IndexKind.QuantizedFlat)]
+        [VectorStoreVector(Dimensions:3, IndexKind = IndexKind.QuantizedFlat)]
         public ReadOnlyMemory<float> TittleEmbedding { get; set; }
-        [VectorStoreVector(Dimensions:256, IndexKind = IndexKind.DiskAnn)]
+        [VectorStoreVector(Dimensions:3, IndexKind = IndexKind.DiskAnn)]
         public ReadOnlyMemory<float> SummaryEmbedding { get; set; }
     }
 }

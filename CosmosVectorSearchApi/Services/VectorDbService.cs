@@ -1,59 +1,111 @@
 namespace CosmosVectorSearchApi.Services
 {
     using System;
-    using System.Collections.Generic;
     using System.Threading.Tasks;
     using System.Linq;
     using Microsoft.Extensions.Logging;
     using CosmosVectorSearchApi.Interfaces;
-    using Microsoft.Extensions.VectorData;
     using CosmosVectorSearchApi.Models;
+    using Microsoft.Extensions.Options;
+    using CosmosVectorSearchApi.Options;
+    using System.Collections.Generic;
+    using Microsoft.Extensions.AI;
+    using System.Numerics.Tensors;
 
     /// <summary>
     /// Service for data ingestion into Cosmos DB
     /// </summary>
-    public class VectorDbServices : IVectorDbService
+    public class VectorDbServices : BaseOllamaEmbeddingService, IVectorDbService
     {
-        private readonly IVectorEmbeddingService _vectorEmbeddingService;
         private readonly ILogger<VectorDbServices> _logger;
         private readonly ICosmosDbClient _cosmosDbClient;
+        private readonly IKustoClient _kustoClient;
 
-        public VectorDbServices(IVectorEmbeddingService vectorEmbeddingService, ILogger<VectorDbServices> logger, ICosmosDbClient cosmosDbClient)
+        public VectorDbServices(
+            ILogger<VectorDbServices> logger,
+            ICosmosDbClient cosmosDbClient,
+            IOptions<OllamaOptions> ollamaOptions,
+            IKustoClient kustoClient)
+        : base(logger, ollamaOptions) // Correctly pass logger and ollamaOptions to base class
         {
-            _vectorEmbeddingService = vectorEmbeddingService ?? throw new ArgumentNullException(nameof(vectorEmbeddingService));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _cosmosDbClient = cosmosDbClient ?? throw new ArgumentNullException(nameof(cosmosDbClient));
+            _kustoClient = kustoClient ?? throw new ArgumentNullException(nameof(kustoClient));
         }
 
-        public async Task IngestDataAsync<TKey, TValue>(string containerName, string partitionKeyPath, VectorStoreCollection<TKey, TValue> collection, IEnumerable<TValue> items)
-            where TKey : notnull
-            where TValue : class
+        public async Task<bool> IngestDataAsync(string databaseName, string collectionName)
         {
             try
             {
-                var container = await _cosmosDbClient.GetOrCreateDatabaseAndContainerAsync(containerName, partitionKeyPath);
-                await collection.EnsureCollectionExistsAsync();               
-                if (typeof(TValue) == typeof(Incident))
-                {
-                    var incidents = items as IEnumerable<Incident>;
-                    if (incidents != null)
-                    {
-                        var tasks = incidents.Select((icm, index) => Task.Run(async () =>
-                        {
-                            // Add a short delay between tasks based on index to prevent throttling
-                            await Task.Delay(index * 50); // 50 milliseconds delay per item
-                            icm.TittleEmbedding = (await _vectorEmbeddingService.GenerateEmbeddingAsync(icm.Title)).Vector;
-                            icm.SummaryEmbedding = (await _vectorEmbeddingService.GenerateEmbeddingAsync(icm.Summary)).Vector;
-                        })); await Task.WhenAll(tasks);
+                _logger.LogInformation("Starting Kusto query and data ingestion");
 
-                        // Cast the incidents collection back to IEnumerable<TValue> for type safety
-                        await collection.UpsertAsync(incidents.Cast<TValue>());
-                        return; // Exit early since we've handled the upsert
+                // Default query if none provided
+                string query = "datawarehouse | take 2000";
+
+                _logger.LogInformation("Executing Kusto query: {Query}", query);
+
+                // Get incidents from Kusto
+                var incidents = await _kustoClient.Query<Incident>(query);
+
+                _logger.LogInformation("Retrieved {Count} incidents from Kusto", incidents.Count);
+
+                if (incidents.Count > 0)
+                {
+                    // Create a vector store collection
+                    var collection = await _cosmosDbClient.GetCosmosNoSqlCollectionAsync<string, Incident>(collectionName, databaseName);
+
+                    await collection.EnsureCollectionExistsAsync();
+
+                    // Process incidents in batches to generate embeddings efficiently
+                    const int batchSize = 20; // Adjust based on your API limits
+                    
+                    for (int i = 0; i < incidents.Count; i += batchSize)
+                    {
+                        // Get the current batch of incidents
+                        var batch = incidents.Skip(i).Take(batchSize).ToList();
+                        
+                        // Extract titles and summaries from this batch
+                        var titles = batch.Select(incident => incident.Title).ToList();
+                        var summaries = batch.Select(incident => incident.Summary).ToList();
+                        
+                        // Generate embeddings for all titles and summaries in this batch
+                        var titleEmbeddings = await GenerateEmbeddingsAsync(titles);
+                        var summaryEmbeddings = await GenerateEmbeddingsAsync(summaries);
+                        
+                        // Assign embeddings to the corresponding incidents
+                        for (int j = 0; j < batch.Count; j++)
+                        {
+                            if (j < titleEmbeddings.Count)
+                            {
+                                batch[j].TittleEmbedding = titleEmbeddings[j].Vector;
+                            }
+                            
+                            if (j < summaryEmbeddings.Count)
+                            {
+                                batch[j].SummaryEmbedding = summaryEmbeddings[j].Vector;
+                            }
+                        }
+                        
+                        // Add a delay between batches to prevent throttling
+                        if (i + batchSize < incidents.Count)
+                        {
+                            await Task.Delay(500);
+                        }
                     }
+
+                    // Apply dimension reduction before upserting
+                    ApplyDimensionReduction(incidents, targetDimension: 5);
+
+                    // Upsert the processed incidents
+                    await collection.UpsertAsync(incidents);
+
+                    _logger.LogInformation("Successfully ingested {Count} incidents into Vector DB", incidents.Count);
+
+                    return true;
                 }
 
-                // Only reaches here if not Incident type or incidents was null
-                await collection.UpsertAsync(items);
+                _logger.LogInformation("No incidents found in Kusto query results");
+                return false;
             }
             catch (Exception ex)
             {
@@ -61,30 +113,316 @@ namespace CosmosVectorSearchApi.Services
                 throw;
             }
         }
-
-        public async Task<IAsyncEnumerable<VectorSearchResult<TValue>>> SearchAsync<TKey, TValue>(
-            VectorStoreCollection<TKey, TValue> collection,
-            string queryText,
-            string vectorField,
-            int limit = 10)
-            where TKey : notnull
-            where TValue : class
+        
+        /// <summary>
+        /// Applies Principal Component Analysis (PCA) dimension reduction to embeddings
+        /// </summary>
+        /// <param name="incidents">List of incidents with embeddings to reduce</param>
+        /// <param name="targetDimension">The target dimension (2 or 3 recommended)</param>
+        private void ApplyDimensionReduction(List<Incident> incidents, int targetDimension = 3)
         {
-            try
+            _logger.LogInformation("Applying dimension reduction to embeddings, target dimension: {TargetDimension}", targetDimension);
+            
+            if (incidents == null || incidents.Count == 0)
             {
-                // Generate embedding for the query text
-                var queryEmbedding = await _vectorEmbeddingService.GenerateEmbeddingAsync(queryText);
-
-                _logger.LogInformation("Performing vector search with query: {QueryText}", queryText);
-
-                // Return search results using the native SearchAsync method of the collection
-                return collection.SearchAsync(queryEmbedding.Vector, limit);
+                return;
             }
-            catch (Exception ex)
+
+            // Create matrices for title and summary embeddings
+            var titleVectors = new List<float[]>();
+            var summaryVectors = new List<float[]>();
+            
+            // Collect all vectors
+            foreach (var incident in incidents)
             {
-                _logger.LogError(ex, "Error performing vector search with query: {QueryText}", queryText);
-                throw;
+                if (!incident.TittleEmbedding.IsEmpty)
+                {
+                    titleVectors.Add(incident.TittleEmbedding.ToArray());
+                }
+                
+                if (!incident.SummaryEmbedding.IsEmpty)
+                {
+                    summaryVectors.Add(incident.SummaryEmbedding.ToArray());
+                }
             }
+            
+            // Apply PCA to title embeddings if there are any
+            if (titleVectors.Count > 0)
+            {
+                var reducedTitleVectors = PerformPCA(titleVectors, targetDimension);
+                
+                // Assign reduced vectors back to incidents
+                int titleIndex = 0;
+                foreach (var incident in incidents)
+                {
+                    if (!incident.TittleEmbedding.IsEmpty)
+                    {
+                        incident.TittleEmbedding = new ReadOnlyMemory<float>(reducedTitleVectors[titleIndex]);
+                        titleIndex++;
+                    }
+                }
+            }
+            
+            // Apply PCA to summary embeddings if there are any
+            if (summaryVectors.Count > 0)
+            {
+                var reducedSummaryVectors = PerformPCA(summaryVectors, targetDimension);
+                
+                // Assign reduced vectors back to incidents
+                int summaryIndex = 0;
+                foreach (var incident in incidents)
+                {
+                    if (!incident.SummaryEmbedding.IsEmpty)
+                    {
+                        incident.SummaryEmbedding = new ReadOnlyMemory<float>(reducedSummaryVectors[summaryIndex]);
+                        summaryIndex++;
+                    }
+                }
+            }
+            
+            _logger.LogInformation("Dimension reduction completed. Reduced {TitleCount} title embeddings and {SummaryCount} summary embeddings to {Dimension} dimensions", 
+                titleVectors.Count, summaryVectors.Count, targetDimension);
+        }
+        
+        /// <summary>
+        /// Performs PCA dimension reduction on a set of vectors
+        /// </summary>
+        /// <param name="vectors">List of vectors to reduce</param>
+        /// <param name="targetDimension">Target dimension for the reduced vectors</param>
+        /// <returns>List of reduced vectors</returns>
+        private List<float[]> PerformPCA(List<float[]> vectors, int targetDimension)
+        {
+            if (vectors == null || vectors.Count == 0)
+            {
+                return new List<float[]>();
+            }
+            
+            int originalDimension = vectors[0].Length;
+            int numVectors = vectors.Count;
+            
+            // If we have fewer vectors than the target dimension or original dimension is already small enough
+            if (numVectors < targetDimension || originalDimension <= targetDimension)
+            {
+                return vectors;
+            }
+            
+            // Step 1: Center the data (subtract mean from each dimension)
+            float[] means = new float[originalDimension];
+            
+            // Calculate means for each dimension
+            for (int i = 0; i < originalDimension; i++)
+            {
+                float sum = 0;
+                for (int j = 0; j < numVectors; j++)
+                {
+                    sum += vectors[j][i];
+                }
+                means[i] = sum / numVectors;
+            }
+            
+            // Center the data
+            float[][] centeredData = new float[numVectors][];
+            for (int i = 0; i < numVectors; i++)
+            {
+                centeredData[i] = new float[originalDimension];
+                for (int j = 0; j < originalDimension; j++)
+                {
+                    centeredData[i][j] = vectors[i][j] - means[j];
+                }
+            }
+            
+            // Step 2: Compute covariance matrix
+            float[][] covarianceMatrix = new float[originalDimension][];
+            for (int i = 0; i < originalDimension; i++)
+            {
+                covarianceMatrix[i] = new float[originalDimension];
+                for (int j = 0; j < originalDimension; j++)
+                {
+                    float sum = 0;
+                    for (int k = 0; k < numVectors; k++)
+                    {
+                        sum += centeredData[k][i] * centeredData[k][j];
+                    }
+                    covarianceMatrix[i][j] = sum / (numVectors - 1);
+                }
+            }
+            
+            // Step 3: Use a simple power iteration method to find principal components
+            // This is a simplified approach - for production, use a proper eigenvalue decomposition library
+            float[][] principalComponents = new float[targetDimension][];
+            
+            for (int d = 0; d < targetDimension; d++)
+            {
+                // Initialize random vector
+                float[] v = new float[originalDimension];
+                Random rand = new Random(d); // Seed for reproducibility
+                for (int i = 0; i < originalDimension; i++)
+                {
+                    v[i] = (float)rand.NextDouble();
+                }
+                
+                // Power iteration to find eigenvector
+                for (int iter = 0; iter < 100; iter++) // Usually converges in far fewer iterations
+                {
+                    float[] vNew = new float[originalDimension];
+                    
+                    // Matrix-vector multiplication
+                    for (int i = 0; i < originalDimension; i++)
+                    {
+                        for (int j = 0; j < originalDimension; j++)
+                        {
+                            vNew[i] += covarianceMatrix[i][j] * v[j];
+                        }
+                    }
+                    
+                    // Normalize
+                    float norm = 0;
+                    for (int i = 0; i < originalDimension; i++)
+                    {
+                        norm += vNew[i] * vNew[i];
+                    }
+                    norm = (float)Math.Sqrt(norm);
+                    
+                    for (int i = 0; i < originalDimension; i++)
+                    {
+                        v[i] = vNew[i] / norm;
+                    }
+                }
+                
+                // Store the principal component
+                principalComponents[d] = v;
+                
+                // Deflate the covariance matrix (optional, for orthogonality)
+                if (d < targetDimension - 1)
+                {
+                    for (int i = 0; i < originalDimension; i++)
+                    {
+                        for (int j = 0; j < originalDimension; j++)
+                        {
+                            covarianceMatrix[i][j] -= v[i] * v[j];
+                        }
+                    }
+                }
+            }
+            
+            // Step 4: Project the data onto the principal components
+            List<float[]> reducedVectors = new List<float[]>();
+            
+            for (int i = 0; i < numVectors; i++)
+            {
+                float[] reducedVector = new float[targetDimension];
+                
+                for (int d = 0; d < targetDimension; d++)
+                {
+                    float dotProduct = 0;
+                    for (int j = 0; j < originalDimension; j++)
+                    {
+                        dotProduct += centeredData[i][j] * principalComponents[d][j];
+                    }
+                    reducedVector[d] = dotProduct;
+                }
+                
+                reducedVectors.Add(reducedVector);
+            }
+            
+            return reducedVectors;
+        }
+        
+        /// <summary>
+        /// Searches for incidents similar to a provided incident
+        /// </summary>
+        /// <param name="incident">The incident to use as a search template</param>
+        /// <param name="databaseName">The database name</param>
+        /// <param name="collectionName">The collection name</param>
+        /// <param name="titleWeight">Weight for the title embedding</param>
+        /// <param name="summaryWeight">Weight for the summary embedding</param>
+        /// <param name="maxResults">Maximum number of results to return</param>
+        /// <returns>A list of similar incidents with their similarity scores</returns>
+        public async Task<IReadOnlyList<(Incident Item, double SimilarityScore)>> SearchSimilarIncidentsAsync(
+            Incident incident,
+            string databaseName,
+            string collectionName,
+            double titleWeight = 0.7,
+            double summaryWeight = 0.3,
+            int maxResults = 10)
+        {
+            _logger.LogInformation("Searching for incidents similar to incident with title: {Title}", incident.Title);
+
+            // Generate embeddings for the incident title and summary
+            var titleTask = GenerateEmbeddingsAsync(new[] { incident.Title });
+            var summaryTask = GenerateEmbeddingsAsync(new[] { incident.Summary });
+
+            await Task.WhenAll(titleTask, summaryTask);
+
+            var titleEmbeddings = await titleTask;
+            var summaryEmbeddings = await summaryTask;
+
+            if (titleEmbeddings == null || titleEmbeddings.Count == 0 ||
+                summaryEmbeddings == null || summaryEmbeddings.Count == 0)
+            {
+                _logger.LogWarning("Failed to generate embeddings for incident with title: {Title}", incident.Title);
+                return Array.Empty<(Incident, double)>();
+            }
+
+            var titleEmbedding = titleEmbeddings[0].Vector.ToArray();
+            var summaryEmbedding = summaryEmbeddings[0].Vector.ToArray();
+            
+            // Reduce dimensions of the search query embeddings to match the stored embeddings
+            var titleVectorList = new List<float[]> { titleEmbedding };
+            var summaryVectorList = new List<float[]> { summaryEmbedding };
+            
+            var reducedTitleVectors = PerformPCA(titleVectorList, 3);
+            var reducedSummaryVectors = PerformPCA(summaryVectorList, 3);
+
+            // Create the embeddings dictionary for multi-vector search
+            var embeddingsAndFields = new Dictionary<string, IReadOnlyList<float>>
+            {
+                ["TittleEmbedding"] = reducedTitleVectors[0],
+                ["SummaryEmbedding"] = reducedSummaryVectors[0]
+            };
+
+            // Create the weights dictionary
+            var weights = new Dictionary<string, double>
+            {
+                ["TittleEmbedding"] = titleWeight,
+                ["SummaryEmbedding"] = summaryWeight
+            };
+
+            // Perform multi-vector search
+            var searchResults = await _cosmosDbClient.MultiVectorSearchAsync<Incident>(
+                containerName: collectionName,
+                databaseName: databaseName,
+                embeddingsAndFields: embeddingsAndFields,
+                weights: weights,
+                maxResults: maxResults
+            );
+
+            _logger.LogInformation("Found {Count} incidents similar to incident with title: {Title}",
+                searchResults.Count, incident.Title);
+
+            return searchResults;
+        }
+        
+        /// <summary>
+        /// Searches for incidents similar to a provided incident using search parameters
+        /// </summary>
+        /// <param name="searchParams">The search parameters including incident and search configuration</param>
+        /// <returns>A list of similar incidents with their similarity scores</returns>
+        public async Task<IReadOnlyList<(Incident Item, double SimilarityScore)>> SearchSimilarIncidentsAsync(
+            IncidentSearchParameters searchParams)
+        {
+            if (searchParams == null)
+            {
+                throw new ArgumentNullException(nameof(searchParams));
+            }
+            
+            return await SearchSimilarIncidentsAsync(
+                incident: searchParams.Incident,
+                databaseName: searchParams.DatabaseName,
+                collectionName: searchParams.CollectionName,
+                titleWeight: searchParams.TitleWeight,
+                summaryWeight: searchParams.SummaryWeight,
+                maxResults: searchParams.MaxResults);
         }
     }
 }

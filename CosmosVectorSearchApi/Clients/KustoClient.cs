@@ -21,12 +21,12 @@ namespace CosmosVectorSearchApi.Clients
         {
             _options = options ?? throw new ArgumentNullException(nameof(options));
         }
-        public async Task<List<T>> Query<T>(string query, string database)
+        public async Task<List<T>> Query<T>(string query)
         {
             var kcsb = new KustoConnectionStringBuilder(_options.Value.KustoUri).WithAadUserPromptAuthentication(_options.Value.TenantId);
             using (var client = KustoClientFactory.CreateCslQueryProvider(kcsb))
             {
-                using (var reader = await client.ExecuteQueryAsync(database, query, null))
+                using (var reader = await client.ExecuteQueryAsync(_options.Value.KustoDatabase, query, null))
                 {
                     var results = new List<T>();
                     var type = typeof(T);

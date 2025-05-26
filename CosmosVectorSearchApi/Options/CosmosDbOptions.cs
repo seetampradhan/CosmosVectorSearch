@@ -19,14 +19,4 @@ public class CosmosDbOptions
     /// The Cosmos DB connection string
     /// </summary>
     public string ConnectionString { get; set; } = string.Empty;
-
-    /// <summary>
-    /// The name of the Cosmos DB database
-    /// </summary>
-    public string DatabaseName { get; set; } = string.Empty;
-
-    /// <summary>
-    /// The name of the Cosmos DB container
-    /// </summary>
-    public string ContainerName { get; set; } = string.Empty;
 }
